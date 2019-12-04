@@ -1,0 +1,196 @@
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+
+#define SIM800_TX_PIN 5       //Sim800 TX se conecta con Nodemcu D1
+#define SIM800_RX_PIN 4       //Sim800 RX se conecta con Nodemcu D2
+SoftwareSerial serialSIM800(SIM800_TX_PIN,SIM800_RX_PIN);
+
+static const int RXPin = 13, TXPin = 15;        //D7 D8; para GPS
+static const uint32_t GPSBaud = 9600;
+
+TinyGPSPlus gps;
+SoftwareSerial ss(RXPin, TXPin);
+
+#define TIMEOUT 30000
+
+String light;
+
+int8_t answer;
+char aux_str[100];
+int x = 0;
+int attempts;
+char apn[] = "claro.pe";                                                    //CAMBIAR APN
+char url[ ]="api.thingspeak.com/update?api_key=1ZO7JC4GALX70V6W&field1=";   //CAMBIAR API_KEY
+
+unsigned long lastConnectionTime = 0;         // última vez que se conectó el servidor en ms
+const unsigned long postingInterval = 15000L; // delay entre cada envio de dato en ms
+
+void setup()
+{
+  Serial.begin(9600);
+  ss.begin(GPSBaud);
+  
+  serialSIM800.begin(9600);
+  delay(1000);
+
+  power_on();
+  delay(3000);
+  
+  while( (sendATcommand("AT+CREG?\r\n", "+CREG: 0,1\r\n", 500) || 
+            sendATcommand("AT+CREG?\r\n", "+CREG: 0,5\r\n", 500)) == 0 );
+  connectToNetwork();
+  initHTTPSession();
+  HTTPRequest(); 
+}
+
+void loop() 
+{
+  while (ss.available() > 0){
+    gps.encode(ss.read());
+    if (gps.location.isUpdated()){      
+      if (millis() - lastConnectionTime > postingInterval) {          //si han pasado 15 seg de la ult conexión, se vuelve a conectar y envíar datos
+        Serial.print("Latitude= ");
+        Serial.println(gps.location.lat(), 6); 
+        light = String(gps.location.lat(),6);
+        Serial.println(light);
+        HTTPRequest();
+      }
+      //Serial.print(" Longitude= "); 
+      //Serial.println(gps.location.lng(), 6);
+    }
+  }
+}
+
+
+
+int8_t sendATcommand(const char* ATcommand, const char* expected_answer1, unsigned int timeout) {
+  uint8_t x = 0,  answer = 0;
+  char response[100];
+  unsigned long previous;
+
+  memset(response, '\0', 100);    // Initialize the string
+  delay(100);
+
+  while (serialSIM800.available())
+  { //Cleans the input buffer
+    serialSIM800.read();
+  }
+  
+  Serial.println(ATcommand);    // Prints the AT command
+  serialSIM800.write(ATcommand); // Sends the AT command
+
+  x = 0;
+  previous = millis();
+
+  // this loop waits for the answer
+  do
+  {
+    ////if (Serial.available() != 0) {
+    if (serialSIM800.available() != 0)
+  {
+      ////response[x] = Serial.read();
+      response[x] = serialSIM800.read();
+      x++;
+      // check if the desired answer is in the response of the module
+      if (strstr(response, expected_answer1) != NULL)
+      {
+        answer = 1;
+      }
+    }
+    // Waits for the asnwer with time out
+  }
+  while ((answer == 0) && ((millis() - previous) < timeout));
+
+  return answer;
+}
+
+void power_on()
+{
+  uint8_t answer = 0;
+  Serial.println("Encendiendo");
+  // checks if the module is started
+  answer = sendATcommand("AT\r\n", "OK\r\n", TIMEOUT);
+  if (answer == 0)
+  {
+    // waits for an answer from the module
+    while (answer == 0)
+    {
+      answer = sendATcommand("AT\r\n", "OK\r\n", TIMEOUT);
+      Serial.println("Tratando de conectar con el modulo...");
+    }
+  }
+  Serial.println("Conexion exitosa con el modulo");
+}
+
+void restartPhoneActivity()
+{
+  do
+  {
+    sendATcommand("AT+CFUN=0\r\n", "OK\r\n", TIMEOUT);
+    delay(2000);
+    answer = sendATcommand("AT+CFUN=1\r\n", "Call Ready\r\n", TIMEOUT);
+  }while(answer == 0);
+}
+
+void connectToNetwork()
+{
+  sendATcommand("AT+SAPBR=3,1,\"Contype\",\"GPRS\"\r\n", "OK\r\n", TIMEOUT);//sets Contype
+  snprintf(aux_str, sizeof(aux_str), "AT+SAPBR=3,1,\"APN\",\"%s\"\r\n", apn);//sets APN
+  sendATcommand(aux_str, "OK\r\n", TIMEOUT);
+  attempts = 0;//tries 3 times or gets on the loop until sendATcommand != 0
+  while (sendATcommand("AT+SAPBR=1,1\r\n", "OK\r\n", TIMEOUT) == 0)
+    {
+      delay(5000);
+      attempts = attempts + 1;
+      if(attempts > 2)
+      {
+        restartPhoneActivity();
+        attempts = 0;
+      }
+    } 
+}
+
+void initHTTPSession()
+{
+  while (sendATcommand("AT+HTTPINIT\r\n", "OK\r\n", TIMEOUT) == 0)
+    {
+    restartPhoneActivity();
+    connectToNetwork();
+   }
+}
+
+void HTTPRequest()
+{
+  ////snprintf(aux_str, sizeof(aux_str), "AT+HTTPPARA=\"URL\",\"%s\"\"%f\"\r\n", url, light);
+  char sensorValue[10];
+  dtostrf(light.toFloat(),5,6,sensorValue);
+  Serial.println(sensorValue);
+  snprintf(aux_str, sizeof(aux_str), "AT+HTTPPARA=\"URL\",\"%s\%s\"\r\n", url, sensorValue);
+  sendATcommand(aux_str, "OK\r\n", TIMEOUT);
+  delay(3000);
+  attempts = 0;//tries 3 times or gets on the loop until sendATcommand != 0
+  while (sendATcommand("AT+HTTPACTION=0\r\n", "+HTTPACTION: 0,200,", TIMEOUT) == 0)
+    {
+      delay(5000);
+      attempts = attempts + 1;
+      if(attempts > 2)
+      {
+        sendATcommand("AT+SAPBR=0,1\r\n", "OK\r\n", 2 * TIMEOUT);
+        sendATcommand("AT+HTTPTERM\r\n", "OK\r\n", TIMEOUT);
+        restartPhoneActivity();
+        connectToNetwork();
+        initHTTPSession();
+        ////snprintf(aux_str, sizeof(aux_str), "AT+HTTPPARA=\"URL\",\"%s\"\r\n", url);
+        char sensorValue[10];
+        dtostrf(light.toFloat(),5,6,sensorValue);
+        Serial.println(sensorValue);
+        snprintf(aux_str, sizeof(aux_str), "AT+HTTPPARA=\"URL\",\"%s\%s\"\r\n", url, sensorValue);
+        sendATcommand(aux_str, "OK\r\n", TIMEOUT);
+        attempts = 0;
+      }
+    }
+  Serial.println("Successfully uploaded");
+  // note the time that the connection was made
+    lastConnectionTime = millis();
+  
+}
